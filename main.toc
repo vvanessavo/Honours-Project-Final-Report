@@ -8,6 +8,22 @@
 \contentsline {subsection}{\numberline {3.1}Dataset}{5}{subsection.3.1}%
 \contentsline {subsection}{\numberline {3.2}System Pipeline Overview}{6}{subsection.3.2}%
 \contentsline {subsection}{\numberline {3.3}Object Detection Training}{7}{subsection.3.3}%
-\contentsline {section}{\numberline {4}Experimental Results}{11}{section.4}%
-\contentsline {subsection}{\numberline {4.1}mAP Evaluation Results}{11}{subsection.4.1}%
-\contentsline {section}{\numberline {5}Conclusion and Future Work}{13}{section.5}%
+\contentsline {subsection}{\numberline {3.4}Mahalanobis Distance and Covariance Model}{11}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Covariance Parameter Calibration}{12}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Semantic Gate MLP}{13}{subsection.3.6}%
+\contentsline {subsubsection}{\numberline {3.6.1}Architecture and Feature Design}{13}{subsubsection.3.6.1}%
+\contentsline {subsubsection}{\numberline {3.6.2}Training Procedure}{14}{subsubsection.3.6.2}%
+\contentsline {subsubsection}{\numberline {3.6.3}Channel Simulation}{15}{subsubsection.3.6.3}%
+\contentsline {subsection}{\numberline {3.7}Discussion and Limitations}{17}{subsection.3.7}%
+\contentsline {subsubsection}{\numberline {3.7.1}What Worked}{17}{subsubsection.3.7.1}%
+\contentsline {subsubsection}{\numberline {3.7.2}Limitations}{18}{subsubsection.3.7.2}%
+\contentsline {paragraph}{Dataset scale and label sparsity.}{18}{section*.14}%
+\contentsline {paragraph}{BEV localization error.}{19}{section*.15}%
+\contentsline {paragraph}{Temporal consistency.}{19}{section*.16}%
+\contentsline {paragraph}{Coordinate alignment.}{19}{section*.17}%
+\contentsline {paragraph}{Channel model fidelity.}{19}{section*.18}%
+\contentsline {paragraph}{Single infrastructure node.}{19}{section*.19}%
+\contentsline {subsubsection}{\numberline {3.7.3}Future Work}{19}{subsubsection.3.7.3}%
+\contentsline {section}{\numberline {4}Experimental Results}{20}{section.4}%
+\contentsline {subsection}{\numberline {4.1}mAP Evaluation Results}{20}{subsection.4.1}%
+\contentsline {section}{\numberline {5}Conclusion and Future Work}{22}{section.5}%
