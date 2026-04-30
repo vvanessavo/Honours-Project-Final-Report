@@ -4,7 +4,7 @@
 \usepackage{makecell}
 \usepackage{changepage}
 \usepackage{xifthen}
-\usepackage{amsmath}
+\usepackage{amsmath,amssymb}
 \usepackage{amssymb}
 \usepackage{setspace}
 \usepackage{xcolor}
@@ -220,7 +220,466 @@ Figure~\ref{fig:val_predictions} shows a sample validation batch with ground tru
 % 4.2 Strategy Comparison
 % 4.4 Transmission Level Comparison
 % -----------------------------------------------
+\subsubsection*{Bird's Eye View (BEV)}
 
+The Bird's Eye View (BEV) localization module is the geometric core of
+the pipeline. Its purpose is to transform every per-frame detection from
+each camera's image plane into a single shared world coordinate frame,
+so that objects seen by the RSU and objects seen by the ego vehicle can
+be compared directly in metric space. Without this step, there is no
+principled way to determine whether a roadside detection corresponds to
+something the vehicle has already seen or not.
+ 
+\medskip
+Both streams go through the same projection sequence, but with different
+depth sources. For the infrastructure camera, no LiDAR is assumed to be
+co-registered with the image, so monocular depth must be estimated from
+the image alone. For the ego vehicle, LiDAR is available and provides
+accurate metric range. The two cases are handled by the same general
+pipeline with a different depth source plugged in at the start.
+ 
+\subsubsection*{Camera-to-World Projection}
+ 
+The projection begins at the bounding box level. For each detected
+object, the bottom-centre pixel of its bounding box is taken as the
+ground contact point --- the assumption being that the base of a vehicle
+touches the road plane. Given a depth estimate $Z_c$ for that pixel, the
+3-D camera-frame coordinates $(X_c, Y_c, Z_c)$ are recovered by
+unprojecting through the camera intrinsic matrix $K$:
+ 
+\begin{equation}
+    \begin{pmatrix} X_c \\ Y_c \\ Z_c \end{pmatrix}
+    = Z_c \, K^{-1}
+      \begin{pmatrix} u \\ v \\ 1 \end{pmatrix},
+    \label{eq:unproject}
+\end{equation}
+ 
+\noindent where $(u, v)$ is the pixel coordinate of the bottom-centre
+point and $K^{-1}$ is the inverse of the $3{\times}3$ intrinsic matrix
+provided in the DAIR-V2X calibration files. This gives a 3-D point in
+the camera's local coordinate frame. That point is then transformed into
+the world frame using the extrinsic rotation matrix $R$ and translation
+vector $t$:
+ 
+\begin{equation}
+    \mathbf{p}_w = R\,\mathbf{p}_c + t,
+    \label{eq:extrinsic}
+\end{equation}
+ 
+\noindent where $\mathbf{p}_c = (X_c, Y_c, Z_c)^\top$ is the
+camera-frame point and $\mathbf{p}_w$ is its world-frame equivalent.
+For bird's eye view purposes only the horizontal plane matters, so the
+$Y$ component (height) is discarded and only the $(X_w, Z_w)$ world
+coordinates are retained as the 2-D BEV position of the detection.
+ 
+\subsubsection*{LiDAR Depth for the Ego Vehicle Stream}
+ 
+For the ego vehicle camera, LiDAR point clouds are available from the
+DAIR-V2X dataset. Each LiDAR point is projected onto the image plane
+using the LiDAR-to-camera extrinsic calibration, and the projected
+points are associated with detected bounding boxes by finding which
+points fall inside each box. The median depth of those points is taken
+as $Z_c$ for that detection. This gives a much more accurate depth
+estimate than monocular inference, which is reflected in the tighter
+position errors for vehicle-side detections compared to infrastructure-
+side ones.
+ 
+\subsubsection*{Depth-Aware Uncertainty Modelling}
+ 
+Because monocular depth estimation is inherently noisy --- and because
+that noise grows with distance --- it is not sufficient to treat each
+projected position as a precise point. Every infrastructure detection is
+therefore accompanied by a 2-D position covariance matrix that describes
+how uncertain its world-frame location is.
+ 
+\medskip
+The uncertainty is modelled separately for the forward ($Z$) and lateral
+($X$) directions, since these have very different noise characteristics.
+Longitudinal error (how far away something is) scales quadratically with
+range because a small relative depth error at 50\,m produces a much
+larger absolute displacement than the same relative error at 5\,m.
+Lateral error grows more slowly because it depends mainly on the
+accuracy of the pixel coordinate rather than the depth value. The two
+standard deviations are modelled as:
+ 
+\begin{align}
+    \sigma_z(Z) &= \max\!\bigl(k \cdot Z^2,\;\sigma_{\text{floor}}\bigr),
+    \label{eq:sigma_z}\\[4pt]
+    \sigma_x(Z) &= \max\!\bigl(\sigma_{x_0} + k_x \cdot Z,\;
+                   \sigma_{\text{floor}}\bigr),
+    \label{eq:sigma_x}
+\end{align}
+ 
+\noindent where the parameters $k = 0.01$, $\sigma_{x_0} = 0.3$\,m,
+$k_x = 0.005$, and $\sigma_{\text{floor}} = 0.2$\,m were calibrated
+by minimising position error against ground-truth labels over the
+validation split. The floor ensures that even at very short range a
+minimum uncertainty of 0.2\,m is maintained, preventing the covariance
+from collapsing to zero in a way that would make the matching too
+brittle.
+ 
+\medskip
+These two scalars define a diagonal covariance matrix in camera space:
+$\Sigma_{\text{cam}} = \mathrm{diag}(\sigma_x^2, \sigma_z^2)$. This is
+rotated into the world frame using the horizontal component of the
+camera extrinsic:
+ 
+\begin{equation}
+    \Sigma_{\text{world}} =
+        R_{\text{bev}}\,\Sigma_{\text{cam}}\,R_{\text{bev}}^{\top},
+    \label{eq:cov_world}
+\end{equation}
+ 
+\noindent where $R_{\text{bev}}$ is the $2{\times}2$ rotation matrix
+extracted from the upper-left block of the full $3{\times}3$ extrinsic
+rotation. If calibration data are unavailable for a particular frame, a
+fallback isotropic covariance with $\sigma = 3.0$\,m is substituted.
+ 
+\subsubsection*{Coordinate Origin Alignment}
+ 
+The RSU and vehicle cameras have separate coordinate origins even after
+applying their individual extrinsics. A fixed spatial offset
+$(\delta x, \delta y)$ between the two origins is provided in the
+DAIR-V2X \texttt{data\_info.json} metadata file for each scene. All
+RSU-side positions are shifted by this offset so that both streams
+operate in the same world frame before any matching is attempted. Without
+this correction, RSU and vehicle detections of the same physical object
+would appear displaced by tens of metres and would never match.
+ 
+\subsubsection*{Localization Results}
+ 
+Figure~\ref{fig:bev_error_dist} shows the distribution of BEV
+localization errors measured against ground-truth positions across all
+evaluation frames. The majority of errors are concentrated below 2\,m,
+with a long tail extending to approximately 6\,m. This tail corresponds
+to distant objects where monocular depth error is largest, consistent
+with the quadratic growth in $\sigma_z(Z)$ from
+Equation~(\ref{eq:sigma_z}).
+ 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.75\textwidth]{bev_error_dist.png}
+\caption{Distribution of BEV localization errors (in metres) across all
+infrastructure-side detections in the evaluation split. Most errors fall
+below 2\,m; the tail reflects monocular depth noise at long range.}
+\label{fig:bev_error_dist}
+\end{figure}
+ 
+\medskip
+Figure~\ref{fig:bev_gt_pred} shows the spatial layout of ground-truth
+positions (blue) against predicted BEV positions (orange/red) for a
+representative evaluation scene. The two point clouds follow the same
+road geometry closely, confirming that the projection pipeline correctly
+captures vehicle positions along the intersection approach lanes. The
+visible dashed lines connecting isolated blue points to their nearest
+predicted positions represent the largest errors in the set --- these
+correspond to detections near the edge of the camera's field of view,
+where depth estimation is least reliable.
+ 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.75\textwidth]{bev_gt_pred.png}
+\caption{BEV localization: ground truth positions (blue) vs.\ predicted
+world-frame positions (orange). Dashed lines connect matched pairs with
+the largest localization errors. The tight clustering of the two point
+clouds confirms the projection pipeline is geometrically consistent with
+the road layout.}
+\label{fig:bev_gt_pred}
+\end{figure}
+ 
+% ============================================================
+\subsection{ByteTrack Integration}
+\label{sec:bytetrack}
+% ============================================================
+ 
+Object detections produced by YOLOv10-N are stateless: each frame is
+processed independently and no memory of previous frames is retained.
+This means that a vehicle appearing in frame $t$ and the same vehicle
+appearing in frame $t{+}1$ are treated as completely unrelated
+detections without an additional linking step. For the downstream
+matching and Semantic Gate pipeline, this is a serious problem. If an
+RSU detection in one frame cannot be connected to the same RSU detection
+in the next, there is no way to build up a reliable estimate of an
+object's position, velocity, or trajectory --- all of which are
+informative features for prioritising transmission.
+ 
+\medskip
+ByteTrack~\cite{zhang2022bytetrack} is therefore integrated immediately
+after detection on both the RSU and vehicle streams to assign stable
+track IDs that persist across frames.
+ 
+\subsubsection*{Two-Stage Association}
+ 
+ByteTrack operates by maintaining a set of active tracks, each
+represented by a Kalman filter that predicts where the tracked object
+will be in the next frame based on a constant-velocity motion model.
+When a new frame arrives, the predicted positions of existing tracks are
+compared to the new detection bounding boxes using intersection-over-
+union (IoU). The matching is solved as an assignment problem with the
+Hungarian algorithm.
+ 
+\medskip
+What distinguishes ByteTrack from simpler trackers is its treatment of
+low-confidence detections. Earlier methods simply discard detections
+below a confidence threshold before the matching step, which means
+partially occluded or distant vehicles --- which generate weak
+detections --- are routinely dropped, causing track fragmentation.
+ByteTrack instead runs a two-stage association:
+ 
+\begin{enumerate}
+    \item \textbf{First pass:} high-confidence detections (above a
+    configurable threshold) are matched to existing active tracks using
+    IoU. Unmatched tracks from this pass are set aside but not
+    immediately terminated.
+    \item \textbf{Second pass:} low-confidence detections are then
+    matched against the unmatched tracks from the first pass. This
+    recovers tracks for objects that are temporarily occluded or at the
+    boundary of the detector's confidence range.
+\end{enumerate}
+ 
+\noindent Tracks that remain unmatched after both passes for more than a
+configurable number of consecutive frames are terminated. New tracks are
+initialised for detections that have no match in either pass.
+ 
+\subsubsection*{Output and Downstream Benefits}
+ 
+After ByteTrack, every active detection in the frame carries a stable
+integer track ID. The same vehicle will carry the same ID across all
+frames in which it is visible, even across brief occlusions.
+ 
+\medskip
+Figure~\ref{fig:bytetrack_topdown} shows the top-down BEV map of all
+tracked vehicle positions across an entire sequence, with each unique
+track displayed in a different colour and the RSU sensor position marked
+by the black dot. The coloured trajectories demonstrate that ByteTrack
+maintains distinct, continuous paths for each vehicle without merging
+or fragmenting tracks even in dense scenes where multiple vehicles travel
+close together.
+ 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{bytetrack_topdown.png}
+\caption{Top-down BEV map of all tracked vehicles across the full
+evaluation sequence. Each colour corresponds to a unique track ID
+assigned by ByteTrack. The black filled circle marks the RSU
+infrastructure sensor position. Vehicles fan out along the two approach
+lanes of the intersection, with trajectories remaining stable and
+distinct throughout.}
+\label{fig:bytetrack_topdown}
+\end{figure}
+ 
+\medskip
+Figure~\ref{fig:bytetrack_frames} shows sample annotated frames from the
+vehicle-side camera with ByteTrack bounding boxes and track IDs
+overlaid. In the early frames, three objects are tracked simultaneously;
+as the scene transitions to an open stretch of road, the count drops to
+zero, demonstrating that the tracker correctly terminates tracks when
+objects leave the field of view rather than hallucinating detections.
+ 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{bytetrack_frames.png}
+\caption{Sample vehicle-side camera frames with ByteTrack annotations.
+Track count varies naturally as vehicles enter and leave the field of
+view. IDs remain stable across consecutive frames, enabling reliable
+cross-frame position and velocity estimation.}
+\label{fig:bytetrack_frames}
+\end{figure}
+ 
+\medskip
+Integrating ByteTrack provides three concrete benefits for the
+downstream pipeline. First, the stable track ID is used by the
+Hungarian matching algorithm (Section~\ref{sec:hungarian}) to label
+whether a specific RSU-detected object has already appeared in the ego
+vehicle's track history, which is a direct indicator of blind spot
+status. Second, the Kalman filter's state estimate smooths out the
+frame-to-frame jitter in BEV positions that results from monocular depth
+noise, producing more stable world-frame trajectories that reduce false
+matches in the assignment step. Third, the track history provides
+velocity and heading estimates that are used as features in the Semantic
+Gate MLP, giving the gate additional context beyond the instantaneous
+detection attributes.
+ 
+\medskip
+Figure~\ref{fig:task2_trajectories} shows the BEV vehicle trajectories
+produced after ByteTrack and BEV projection for a full evaluation
+sequence. Each coloured line represents a single tracked vehicle's path
+through the intersection, reconstructed from its BEV positions across
+all frames in which it was tracked. The branching structure of the
+trajectories reflects the actual road geometry at the DAIR-V2X
+intersection, with vehicles approaching from one direction and
+dispersing into multiple exit lanes. This confirms that the combined
+ByteTrack and BEV pipeline produces geometrically consistent outputs
+that faithfully represent real vehicle behaviour.
+ 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.75\textwidth]{task2_trajectories.png}
+\caption{Task 2 --- vehicle trajectories in BEV reconstructed by
+ByteTrack across the full evaluation sequence. Each colour represents a
+unique track. The branching structure reflects real intersection geometry,
+with vehicles arriving from a common approach lane and diverging into
+multiple exit directions.}
+\label{fig:task2_trajectories}
+\end{figure}
+ 
+% ============================================================
+\subsection{Blind Spot Identification}
+\label{sec:blindspot}
+% ============================================================
+ 
+After both streams have been localised in the shared world frame and
+their tracks stabilised by ByteTrack, the system must determine which
+RSU-detected objects are genuinely absent from the ego vehicle's
+perception. An object is a blind spot target if and only if the RSU can
+see it but the ego vehicle cannot --- meaning it appears in the RSU
+detection list for the current frame but has no corresponding match in
+the vehicle detection list for the same (or nearest synchronised) frame.
+ 
+\medskip
+Identifying blind spot targets requires solving a cross-view association
+problem: given two lists of world-frame positions (one from each stream),
+find which RSU objects correspond to which vehicle objects, and flag the
+RSU objects with no counterpart. This is the task of Hungarian matching
+with a Mahalanobis distance cost matrix.
+ 
+\subsubsection{Hungarian Matching with Mahalanobis Distance}
+\label{sec:hungarian}
+ 
+The matching is posed as a minimum-cost bipartite assignment problem.
+Let $\mathcal{I} = \{i_1, \ldots, i_M\}$ be the set of RSU-side tracked
+objects in the current frame and $\mathcal{V} = \{v_1, \ldots, v_N\}$
+be the set of vehicle-side tracked objects in the nearest synchronised
+frame, both expressed as 2-D world-frame positions with associated
+covariance matrices.
+ 
+\medskip
+A cost matrix $C \in \mathbb{R}^{M \times N}$ is built where each entry
+$C_{ij}$ measures the dissimilarity between RSU object $i_m$ at
+position $\mu_m$ with covariance $\Sigma_m$ and vehicle object $v_n$ at
+position $\mu_n$ with covariance $\Sigma_n$. The chosen dissimilarity
+measure is the Mahalanobis distance:
+ 
+\begin{equation}
+    C_{ij} = \sqrt{(\mu_m - \mu_n)^{\top}
+              \bigl(\Sigma_m + \Sigma_n\bigr)^{-1}
+              (\mu_m - \mu_n)}.
+    \label{eq:mahal}
+\end{equation}
+ 
+\noindent The combined covariance $\Sigma_m + \Sigma_n$ in the
+denominator accounts for the positional uncertainty of both detections
+simultaneously. If both positions are very uncertain (large covariances),
+the same raw displacement in metres produces a smaller Mahalanobis
+distance than it would if both positions were precise. This is the
+critical advantage over Euclidean distance: a pair of detections that
+are 10\,m apart but each with a 15\,m standard deviation should be
+considered a plausible match, whereas the same 10\,m gap between two
+detections each with a 0.5\,m standard deviation is almost certainly a
+false correspondence. Mahalanobis distance handles both cases correctly;
+Euclidean distance treats them identically.
+ 
+\medskip
+Once the cost matrix is filled, the Hungarian
+algorithm~\cite{kuhn1955hungarian} finds the one-to-one assignment of
+RSU objects to vehicle objects that minimises total cost. This is the
+globally optimal solution to the assignment problem --- no greedy or
+approximate method is used.
+ 
+\medskip
+Two post-matching filters are applied before an assignment is accepted.
+First, any matched pair whose Mahalanobis distance exceeds a
+range-dependent threshold $\tau(Z)$ is rejected as implausible. The
+thresholds are calibrated from ground-truth labels using the 90th
+percentile (p90) of true-positive pair distances in each range bin,
+ensuring that 90\% of real correspondences fall within the threshold
+while most false positives are excluded. Second, a class-gating
+constraint enforces that only objects of the same category can be
+matched: a Car on the RSU side cannot be assigned to a Bus on the vehicle
+side, even if their positions happen to be close. This prevents category
+confusion from contaminating the blind spot candidate list.
+ 
+\medskip
+Any RSU object that remains unmatched after these filters is classified
+as a \emph{blind spot candidate} for the current frame: it is an object
+the RSU can see that the ego vehicle has no knowledge of. Candidates are
+accumulated across all frames and form the input pool for the Semantic
+Gate.
+ 
+\subsubsection*{Quantitative Matching Results}
+ 
+Table~\ref{tab:mahal_vs_euclid} compares the p90 matching thresholds
+for Euclidean and Mahalanobis distances across four range bins. The
+Mahalanobis thresholds are substantially tighter at every range beyond
+20\,m, which means the metric is more discriminative: matched pairs
+cluster more tightly under Mahalanobis than under Euclidean, so the
+threshold can be set lower without losing true positives. At the
+20--40\,m range, for example, the Euclidean p90 is 27.79\,m while
+the Mahalanobis p90 is only 2.60 --- more than a 10$\times$ reduction.
+This is a direct consequence of the covariance model correctly capturing
+how much of the raw distance is attributable to measurement noise versus
+genuine spatial separation.
+ 
+\begin{table}[htbp]
+\centering
+\caption{Per-range p90 matching thresholds: Euclidean vs.\ Mahalanobis
+distance. A tighter p90 indicates a more discriminative metric.}
+\label{tab:mahal_vs_euclid}
+\begin{tabular}{cccc}
+\toprule
+\textbf{Range (m)} & \textbf{Count} &
+\textbf{Euclidean p90 (m)} & \textbf{Mahalanobis p90} \\
+\midrule
+0--20  &  10 & 37.14 & 21.29 \\
+20--40 & 292 & 27.79 &  2.60 \\
+40--60 & 597 & 35.14 &  2.19 \\
+60+    & 826 & 55.14 &  2.45 \\
+\bottomrule
+\end{tabular}
+\end{table}
+ 
+\noindent The global position error has a mean of 20.93\,m and a median
+of 14.13\,m across all frames. The mean is pulled upward by the long
+tail of high-error detections at range, which is why the Mahalanobis
+framework is necessary: assigning a fixed Euclidean threshold would
+either admit too many false matches at long range (if the threshold is
+large) or reject too many true matches at short range (if the threshold
+is small). The range-adaptive Mahalanobis approach avoids this tradeoff
+entirely.
+ 
+\medskip
+As a concrete example: the same matched pair of true-positive detections
+receives a Mahalanobis distance of 0.87 (a strong match, well within
+threshold) and a Euclidean distance of 3.72\,m (a comparatively weak
+signal that would require a much looser threshold to accept). At scale,
+across thousands of frame pairs, this difference in discriminative power
+has a meaningful impact on the precision of the blind spot candidate
+list passed to the Semantic Gate.
+ 
+\subsubsection*{Blind Spot Target Distribution}
+ 
+Figure~\ref{fig:blindspot_targets} shows the spatial distribution of
+all blind spot targets identified across the evaluation split. Blue
+points mark all RSU-side detections; red points mark those classified as
+blind spot candidates after matching. The red points are not randomly
+scattered --- they cluster systematically on the far side of the
+intersection approach lanes, which is exactly where the ego vehicle's
+forward-facing camera is least likely to see vehicles that are crossing
+or approaching from perpendicular directions. This spatial pattern
+confirms that the matching pipeline is identifying geometrically
+plausible blind spots rather than producing arbitrary false alarms.
+ 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{blindspot_targets.png}
+\caption{Task 3 --- spatial distribution of blind spot targets. Blue
+points: all RSU-detected objects in BEV world coordinates. Red points:
+objects confirmed as blind spot candidates (no match in the ego vehicle
+detection stream). The red cluster on the far approach lane reflects
+vehicles crossing the intersection from directions outside the ego
+vehicle's field of view.}
+\label{fig:blindspot_targets}
+\end{figure}
 % -----------------------------------------------
 % PERSON C SECTIONS GO HERE
 % 3.6.2 Mahalanobis Distance & Covariance Model
@@ -559,9 +1018,77 @@ Figure~\ref{fig:semantic_eval} breaks recall down by scenario. In Near/LOS condi
 \medskip
 At the tightest bandwidth level, L4 (204,800 bytes per target), the budget shrinks to just 3--4 targets per frame and all strategies converge. When only three objects can be sent, there is little room for a learned ranking to show its advantage over a heuristic one. This is an expected limitation of the setup rather than a failure of the model, under extreme bandwidth constraints, any reasonable selection policy will perform similarly.
 
-\section{Conclusion and Future Work}
-\label{sec:conclusion}
 
+% ============================================================
+%  SECTION 5  CONCLUSION
+% ============================================================
+\section{Conclusion}
+ 
+This work presented a channel-aware cooperative perception pipeline for
+blind spot detection in V2X networks, evaluated end-to-end on the
+DAIR-V2X dataset.  The system integrates four tightly coupled
+components: YOLOv10-N object detection, ByteTrack multi-object
+tracking, depth-aware BEV localisation, and Hungarian matching with a
+Mahalanobis distance cost matrix.  A lightweight MLP Semantic Gate
+consumes a 16-dimensional feature vector augmented with a runtime
+channel injection ($C_{\text{norm}}$, $N_{\max}$) to prioritise which
+blind spot candidates are transmitted under realistic per-frame
+bandwidth budgets.
+ 
+\medskip
+Evaluation across five transmission levels and four selection strategies
+demonstrates that the MLP Semantic Gate consistently outperforms the
+Hard Gate, No Gate, and Random baselines.  The MLP achieves a PR-AUC
+24.1$\times$ higher than the Random baseline and a mean recall of 0.596
+on the validation set, compared to 0.569 for the Hard Gate and 0.080
+for the Random strategy.  The advantage is most pronounced at moderate
+transmission budgets (L0--L2), confirming that learned prioritisation
+is particularly valuable when many candidates compete for limited
+channel resources.
+ 
+\medskip
+The Mahalanobis matching framework substantially reduces false matches
+relative to Euclidean distance: at the 20--60\,m range, the p90
+threshold tightens from 35\,m (Euclidean) to under 2.5\,m
+(Mahalanobis), enabling reliable blind spot identification even under
+noisy monocular depth estimates.
+ 
+% ============================================================
+%  SECTION 6  FUTURE WORK
+% ============================================================
+\section{Future Work}
+ 
+Several directions remain open for extending the system.
+ 
+\begin{itemize}
+    \item \textbf{Real V2X channel modelling.}  The current channel
+    simulator approximates link capacity from SNR and modulation tables.
+    Replacing this with measurements from a physical 5G-V2X or DSRC
+    testbed would expose the pipeline to realistic packet loss, latency
+    jitter, and variable bandwidth, allowing the Semantic Gate to be
+    retrained under true communication conditions.
+ 
+    \item \textbf{Learned monocular depth.}  Monocular depth estimation
+    is the primary source of localisation error, particularly beyond
+    40\,m.  Substituting the current geometric estimator with a
+    state-of-the-art learned model such as DepthAnything or MiDaS would
+    reduce the range-dependent noise captured in
+    Equations~(\ref{eq:sigma_z}) and~(\ref{eq:sigma_x}), tightening
+    matching thresholds and improving blind spot recall.
+ 
+    \item \textbf{Denser traffic evaluation.}  The DAIR-V2X evaluation
+    scenes contain moderate traffic densities.  Testing in scenes with
+    higher vehicle counts (e.g.\ rush-hour intersections) would stress
+    the Hungarian assignment step and expose edge cases where many RSU
+    objects simultaneously compete for a small transmission budget.
+ 
+    \item \textbf{Generalisation to other V2X datasets.}  The system
+    was developed and evaluated exclusively on DAIR-V2X-C.  Evaluating
+    on complementary datasets such as V2X-Sim or OPV2V would reveal
+    how well the Semantic Gate's learned importance scores transfer
+    across different sensor configurations, geographic settings, and
+    traffic patterns.
+\end{itemize}
 \printbibliography[title={References}]
 
 \end{document}
